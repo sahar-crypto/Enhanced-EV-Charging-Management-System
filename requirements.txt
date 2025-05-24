@@ -1,0 +1,9 @@
+django
+djangorestframework
+djangorestframework-simplejwt
+channels
+channels-redis
+websockets
+daphne
+django-cors-headers
+ocpp

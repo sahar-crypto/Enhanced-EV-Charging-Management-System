@@ -1,4 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="VcsDirectoryMappings" defaultProject="true" />
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/Simulators/MicroOcppSimulator" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/Simulators/OCPP-1.6-Chargebox-Simulator" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/Simulators/charger-simulator" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/Simulators/e-mobility-charging-stations-simulator" vcs="Git" />
+  </component>
 </project>

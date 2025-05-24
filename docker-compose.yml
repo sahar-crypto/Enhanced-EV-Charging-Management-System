@@ -1,0 +1,79 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    image: ev_charging_system:latest
+    container_name: ev_charging_web
+    restart: on-failure
+    # Use the simplified command
+    command:
+      bash -c "
+      python3 manage.py makemigrations &&
+      python3 manage.py migrate &&
+      python3 manage.py runserver 0.0.0.0:9000
+      "
+    ports:
+      - "9000:9000"
+    volumes:
+      - .:/app
+    networks:
+      - charging_network
+    depends_on:
+      - redis
+
+  redis:
+    image: "redis:latest"
+    container_name: ev_charging_redis
+    hostname: "redis"
+    restart: always
+    ports:
+      - "6379:6379"
+    networks:
+      - charging_network
+
+#  simulator:
+#    build:
+#      context: .
+#      dockerfile: e-mobility-charging-stations-simulator/docker/Dockerfile
+#      args:
+#        STACK_TRACE_LIMIT: 1024
+#        MAX_OLD_SPACE_SIZE: 768
+#    image: e-mobility-charging-stations-simulator:latest
+#    container_name: ev_charging_simulator
+#    ports:
+#      - "8000:8000"
+#    networks:
+#      - charging_network
+#    extra_hosts:
+#      - "web:172.19.0.4"
+
+#  simulator:
+#    image: matthx/microocppsimulator:latest
+#    environment:
+#      - OCPP_SERVER_URL=ws://web:9000/ws/charging/station/DTS-CC-001/CHG001
+#    depends_on:
+#      - web
+#    container_name: ev_charging_simulator
+#    ports:
+#      - "8000:8000"
+#    networks:
+#      - charging_network
+#    extra_hosts:
+#      - "web:172.19.0.4"
+
+
+#  simulator:
+#    container_name: ev-simulator
+#    build:
+#      context: ./ocpp-simulator  # path to simulator project
+#    ports:
+#      - "8000:8000"
+#    networks:
+#      - charging_network
+#    depends_on:
+#      - web
+
+networks:
+  charging_network:
+    driver: bridge

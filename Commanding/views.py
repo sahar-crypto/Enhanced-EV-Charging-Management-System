@@ -1,42 +1,29 @@
-from Commanding.models import Transaction
-from Charging.models import EVCharger
-from django.contrib.auth.decorators import login_required
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
-from decimal import Decimal
-from django.http import JsonResponse
 
+class SendCommandAPIView(APIView):
+    permission_classes = [IsAuthenticated]
 
+    def post(self, request, station_code):
+        command = request.data.get('command')
+        target_charger = request.data.get('target_charger')
 
-@login_required
-def send_remote_command(request, charger_id):
-    command = request.GET.get('command')
-    amount = request.GET.get('amount', None)  # Optional
+        if not command or not target_charger:
+            return Response({'error': 'Missing command or target_charger'}, status=status.HTTP_400_BAD_REQUEST)
 
-    try:
-        charger = EVCharger.objects.get(ID=charger_id)
-    except EVCharger.DoesNotExist:
-        return JsonResponse({'error': 'Charger not found'}, status=404)
+        group_name = f'ev_station_{station_code}'
+        channel_layer = get_channel_layer()
 
-    channel_layer = get_channel_layer()
-    try:
         async_to_sync(channel_layer.group_send)(
-            f'charging_station_{charger_id}',
+            group_name,
             {
                 'type': 'send_command',
-                'command': command
+                'command': command,
+                'target_charger': target_charger,
             }
         )
-    except Exception as e:
-        return JsonResponse({'error': f'Failed to send command: {str(e)}'}, status=500)
-
-    # Save the transaction ONLY if sending succeeded
-    Transaction.objects.create(
-        user=request.user,
-        command=command,
-        amount=Decimal(amount) if amount else None,
-        charger=charger
-    )
-
-    return JsonResponse({'message': 'Command sent and saved successfully'})
-
+        return Response({'status': 'command sent'}, status=status.HTTP_200_OK)

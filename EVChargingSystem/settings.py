@@ -31,12 +31,11 @@ ALLOWED_HOSTS = []
 # Application definition
 
 INSTALLED_APPS = [
-    'django.contrib.admin',
-    'django.contrib.auth',
-    'django.contrib.contenttypes',
-    'django.contrib.sessions',
-    'django.contrib.messages',
-    'django.contrib.staticfiles',
+    # My apps
+    'corsheaders',
+    'channels_redis',
+    'daphne',
+    'ocpp',
     'rest_framework',
     'rest_framework_simplejwt',
     'channels',
@@ -44,6 +43,14 @@ INSTALLED_APPS = [
     'Charging',
     'Invoicing',
     'Commanding',
+    
+    # Django's default apps
+    'django.contrib.admin',
+    'django.contrib.auth',
+    'django.contrib.contenttypes',
+    'django.contrib.sessions',
+    'django.contrib.messages',
+    'django.contrib.staticfiles',
 ]
 
 AUTH_USER_MODEL = 'Users.User'
@@ -56,6 +63,7 @@ REST_FRAMEWORK = {
 }
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -87,11 +95,16 @@ WSGI_APPLICATION = 'EVChargingSystem.wsgi.application'
 ASGI_APPLICATION = "EVChargingSystem.asgi.application"
 
 # Add channel layers setting (for Redis)
+# CHANNEL_LAYERS = {
+#     "default": {
+#         "BACKEND": "channels.layers.InMemoryChannelLayer"
+#     }
+# }
 CHANNEL_LAYERS = {
-    "default": {
-        "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {
-            "hosts": [("127.0.0.1", 6379)],
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            "hosts": [('ev_charging_redis', 6379)],
         },
     },
 }
@@ -147,3 +160,11 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:8080",
+]
+
+CHANNELS_CORS_ALLOWED_ORIGINS = [
+    "http://localhost:8080",
+]
