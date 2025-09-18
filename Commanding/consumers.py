@@ -1,8 +1,7 @@
 import logging
 import json
 from channels.db import database_sync_to_async
-from channels.generic.websocket import AsyncWebsocketConsumer
-from channels.layers import get_channel_layer
+from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from django.contrib.auth.models import AnonymousUser
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.tokens import AccessToken
@@ -12,36 +11,147 @@ from Commanding.models import Transaction, StatusLog, HeartbeatLog
 from django.db import transaction
 from ocpp.routing import on
 from ocpp.v16 import ChargePoint as cp
-from ocpp.v16.enums import RegistrationStatus
+from ocpp.v16.enums import RegistrationStatus, AuthorizationStatus
 from ocpp.v16 import call_result
-from datetime import datetime
-
+from django.utils.timezone import now
+from django.conf import settings
 
 logger = logging.getLogger(__name__)
 connected_chargers = {}
 
 class ChargePoint(cp):
+    def __init__(self, id, connection):
+        super().__init__(id, connection)
+        self.id = id
+
     @on('BootNotification')
-    async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
-        logger.info(f"[{self.id}] BootNotification from model '{charge_point_model}', vendor '{charge_point_vendor}'")
-        return call_result.BootNotificationPayload(
-            current_time=datetime.now().isoformat(),
-            interval=10,
+    async def on_boot_notification(self, charge_point_model, **kwargs):
+        interval = getattr(settings, "HEARTBEAT_INTERVAL", 10)
+        logger.info(f"[{self.id}] BootNotification from model '{charge_point_model}'")
+        return call_result.BootNotification(
+            current_time=now().isoformat(),
+            interval=interval,
             status=RegistrationStatus.accepted
         )
 
     @on('Heartbeat')
     async def on_heartbeat(self):
         logger.info(f"[{self.id}] Received Heartbeat")
-        return call_result.HeartbeatPayload(current_time=datetime.now().isoformat())
+        return call_result.Heartbeat(current_time=now().isoformat())
 
-class ChargingConsumer(AsyncWebsocketConsumer):
+    @on('StatusNotification')
+    async def on_status_notification(self, status, connector_id, **kwargs):
+        logger.info(f"[{self.id}] StatusNotification: {status} for connector {connector_id}")
+        return call_result.StatusNotification()
+
+    @on('StartTransaction')
+    async def on_start_transaction(self, id_tag, connector_id, meter_start, timestamp, **kwargs):
+        logger.info(f"[{self.id}] StartTransaction from {id_tag} on connector {connector_id}")
+        # In a real system, validate the id_tag and generate a real transaction_id
+        return call_result.StartTransaction(
+            transaction_id=1,
+            id_tag_info={
+                'status': AuthorizationStatus.accepted.value
+            }
+        )
+
+    @on('StopTransaction')
+    async def on_stop_transaction(self, meter_stop, timestamp, transaction_id, **kwargs):
+        logger.info(f"[{self.id}] StopTransaction for transaction {transaction_id}")
+        return call_result.StopTransaction()
+
+class BaseConsumer(AsyncJsonWebsocketConsumer):
 
     def __init__(self, *args, **kwargs):
         self.charger_id = None
+        self.station_id = None
         self.user = None
         self.group_name = None
         super().__init__(*args, **kwargs)
+
+    async def broadcast_status(self, event):
+
+        logger.info("Broadcasting status to all connected consumers.")
+        await self.send_json({
+            'event': 'status_update',
+            'charger_id': event['charger_serial_number'],
+            'status': event['status'],
+        })
+
+    async def broadcast_heartbeat(self, event):
+
+        logger.info("Broadcasting heartbeat to all connected consumers.")
+        await self.send_json({
+            'event': 'heartbeat_update',
+            'charger_id': event['charger_serial_number'],
+            'time': event['time'],
+        })
+
+    @database_sync_to_async
+    def save_status(self, serial_number, status, payload):
+        with transaction.atomic():
+            charger, _ = EVCharger.objects.get_or_create(serial_number=serial_number)
+            StatusLog.objects.create(charger=charger,
+                                     status=status,
+                                     payload=payload)
+            logger.info(
+                f"Status update received from charger {serial_number}: {status} - {payload}"
+            )
+
+    @database_sync_to_async
+    def save_heartbeat(self, serial_number, data):
+        charger, _ = EVCharger.objects.get_or_create(serial_number=serial_number)
+        HeartbeatLog.objects.create(charger=charger, payload=data)
+        logger.info(f"Heartbeat saved for charger {serial_number}: {data}")
+
+    @database_sync_to_async
+    def save_transaction(self, serial_number, command):
+        if not hasattr(self, 'user') or self.user is None or not self.user.is_authenticated:
+            logger.error("Cannot save transaction: No authenticated user")
+            return
+
+        try:
+            customer = Customer.objects.get(user=self.user)
+        except Customer.DoesNotExist:
+            logger.error(f"No Customer found for user {self.user}")
+            return
+
+        try:
+            charger = EVCharger.objects.get(serial_number=serial_number)
+        except EVCharger.DoesNotExist:
+            logger.error(f"No charger found with serial number {serial_number}")
+            return
+
+        with transaction.atomic():
+            Transaction.objects.create(
+                charger=charger,
+                command=command,
+                customer=customer
+            )
+
+        logger.info(f"Transaction saved for charger {serial_number} with command {command}")
+
+    @database_sync_to_async
+    def update_charger_status(self, serial_number, status='available'):
+
+        charger, _ = EVCharger.objects.get_or_create(serial_number=serial_number)
+        charger.status = status
+        charger.save()
+
+        StatusLog.objects.create(charger=charger, status=status)
+        logger.info(f"Updated charger {serial_number} status to {status}")
+
+    @database_sync_to_async
+    def get_latest_status(self, charger_id):
+        try:
+            return EVCharger.objects.get(
+                serial_number=charger_id
+            ).status
+        except EVCharger.DoesNotExist:
+            return "Unknown"
+
+class MonitoringConsumer(BaseConsumer):
+
     async def connect(self):
         """
         Connects the WebSocket to an EV station using the station code provided in the URL. It retrieves,
@@ -59,7 +169,7 @@ class ChargingConsumer(AsyncWebsocketConsumer):
         self.station_id = self.scope['url_route']['kwargs']['station_code']
         self.charger_id = self.scope['url_route']['kwargs']['serial_number']
         self.group_name = f'ev_charger_{self.charger_id}'
-        # Extract token from Authorization header
+        # Extract token from the authorization header
         token = None
         for header in self.scope['headers']:
             if header[0] == b'authorization':
@@ -106,7 +216,10 @@ class ChargingConsumer(AsyncWebsocketConsumer):
         # Store the charge point globally for later access
         connected_chargers[self.charger_id] = self.charge_point
 
-        await self.send(text_data=f"Connected to charger {self.charger_id}")
+        # 🔁 Get the latest status and send it
+        status = await self.get_latest_status(self.charger_id)
+        await self.send_json({"status": status})
+        await self.send_json({"message": f"Connected to charger {self.charger_id}"})
         logger.info(f"Charger {self.charger_id} connected.")
 
     async def disconnect(self, close_code):
@@ -134,193 +247,137 @@ class ChargingConsumer(AsyncWebsocketConsumer):
         else:
             logger.error("Channel layer is not configured.")
 
-    async def receive(self, text_data):
-
+    async def receive_json(self, content, **kwargs):
         """
-        Receives and processes data sent from a charging station. The method decodes
-        and processes incoming JSON messages, discriminating different operation statuses,
-        and carries out appropriate handling or delegations. It also interfaces with
-        a configured channel layer to broadcast updates about charging station statuses
-        to a group, provided setup is available.
+        Receives and processes JSON-decoded data sent from a charging station.
 
         Args:
-            text_data (str): The JSON-encoded string sent from a charging station containing
-                details like serial number, status, and potentially additional data.
-
-        Raises:
-            Exception: For various errors encountered during the processing of the received message,
-                such as JSON decoding issues, missing data, or unexpected operation states.
+            content (list or dict): Decoded JSON content from the charging station.
         """
         logger.info("Receiving data from charging station.")
-        try:
-            msg = json.loads(text_data)
-            message_type = msg[0]
-            if message_type != 2:
-                logger.warning(f"Unsupported message type: {message_type}")
-                return
-            await self.charge_point.route_message(msg)
-            action = msg[2]
-            payload = msg[3]
-            if message_type == 2 and action == "Heartbeat":
-                await self.save_heartbeat(self.charger_id, payload)
-            elif message_type == 2 and action in ["StartTransaction", "StopTransaction"]:
-                await self.save_transaction(self.charger_id, action)
-            elif message_type == 2 and action in ["StatusNotification", "DiagnosticsStatusNotification"]:
-                await self.save_status(self.charger_id, action, payload)
-                await self.update_charger_status(self.charger_id, action)
 
+        try:
+            msg = content  # Already decoded from JSON
+
+            if isinstance(msg, list) and len(msg) > 0:
+                message_type = msg[0]
+            else:
+                logger.warning(f"Unexpected message format: {msg}")
+                return
+
+            if message_type != 2:
+                logger.warning(f"Unsupported message type: {msg}")
+                return
+
+            # Route the message through your internal handler
+            await self.charge_point.route_message(json.dumps(msg))
+            logger.debug(f"Message received: {msg}")
+            # Unpack action and payload
+            action = msg[2]
+            payload = msg[3] if len(msg) > 3 else {}
+
+            if action == "Heartbeat":
+                await self.save_heartbeat(self.charger_id, payload)
+                await self.channel_layer.group_send(
+                    self.group_name,
+                    {
+                        'type': 'broadcast_heartbeat',
+                        'charger_serial_number': self.charger_id,
+                        'time': str(now().isoformat()),
+                    }
+                )
+                logger.info(f"Broadcasted heartbeat to group {self.group_name}")
+            elif action in ["StartTransaction", "StopTransaction"]:
+                await self.save_transaction(self.charger_id, action)
+                if action == "StartTransaction":
+                    status = "Charing"
+                else:
+                    status = "Available"
+                await self.update_charger_status(self.charger_id, status)
+            elif action in ["StatusNotification", "DiagnosticsStatusNotification"]:
+                status = payload.get("status")
+                await self.save_status(self.charger_id, status, payload)
+                await self.update_charger_status(self.charger_id, status)
+
+            # Get latest charger info
+            status = await self.get_latest_status(self.charger_id)
+
+            # Broadcast status to group
             if self.channel_layer is not None:
                 await self.channel_layer.group_send(
-                    'charging_dashboard',
+                    self.group_name,
                     {
                         'type': 'broadcast_status',
                         'charger_serial_number': self.charger_id,
-                        'status_data': msg
+                        'status': status,
                     }
                 )
+                logger.info(f"Broadcasted status to group {self.group_name}")
             else:
                 logger.error("Channel layer is not configured.")
+
         except Exception as e:
             logger.error(f"[{self.charger_id}] Error processing message: {e}")
-            await self.send(text_data=json.dumps({'error': str(e)}))
+            await self.send_json({'error': str(e)})
 
-    async def send_command(self, event):
+class CommandingConsumer(BaseConsumer):
 
-        """
-        Sends a command to an electric vehicle charger for execution, handling command
-        validation, charger state, and updating necessary records. Commands can either
-        start or stop charging based on the charger's activity state.
+    async def connect(self):
+        self.station_id = self.scope['url_route']['kwargs']['station_code']
+        self.charger_id = self.scope['url_route']['kwargs']['serial_number']
+        self.group_name = f'ev_charger_{self.charger_id}'
+        await self.accept()
+        logger.info(f"Connected to commanding consumer for charger {self.charger_id}")
 
-        Sections:
-        Args:
-            event: dict
-                An event dictionary containing the 'command' to execute and optionally
-                the 'target_charger' serial number.
+    async def receive_json(self, content, **kwargs):
+        command = content.get("action")
+        target_charger = self.charger_id
+        logger.info(f"Sending command {command} to charger {target_charger}")
 
-        Raises:
-            No explicit exceptions are raised. Errors are logged and serialized JSON
-            error responses are sent back to the client.
-        """
-        command = event['command']
-        target_charger = event.get('target_charger')
-        group_name = f'ev_charger_{target_charger}'
+        # Route the message through your internal handler
+        await self.charge_point.route_message(json.dumps(content))
         try:
             charger = EVCharger.objects.get(serial_number=target_charger)
         except EVCharger.DoesNotExist:
             logger.error(f"Charger {target_charger} does not exist.")
             return
         # Check if the charger is already busy or available
-        if command.lower() == 'remotestarttransaction' and charger.activity == 'charging':
+        if command.lower() == 'remotestarttransaction' and charger.status == 'charging':
             logger.info(f"Charger {target_charger} is already charging, ignoring command.")
-            await self.send(text_data=json.dumps({
+            await self.send_json({
                 'error': 'target charger is busy, cannot start charging.',
-            }))
+            })
             return
-        elif command.lower() == 'remotestoptransaction' and charger.activity == 'idle':
+        elif command.lower() == 'remotestoptransaction' and charger.status == 'available':
             logger.info(f"Charger {target_charger} is already available, ignoring command.")
-            await self.send(text_data=json.dumps({
+            await self.send_json({
                 'error': 'target charger is already idle, cannot stop charging.',
-            }))
+            })
             return
         # If the command is compatible with the charger status, send it
         else:
-            await self.send(text_data=json.dumps({
-                'event': 'command_received',
-                'command': command,
-                'target_charger': target_charger
-            }))
-        try:
-            await self.channel_layer.group_send(
-                group_name,
-                {
-                    'type': 'send',
-                    'event': 'command_received',
-                    'command': command,
-                    'target_charger': target_charger
-                }
-            )
-            await self.save_transaction(target_charger, command)
-            await self.update_charger_status(target_charger, command)
-            logger.info(f"Command sent to charger {target_charger}: {command}")
-        except Exception as e:
-            logger.error(f"Error sending command to charger {target_charger}: {e}")
-            await self.send(text_data=json.dumps({'error': str(e)}))
+            try:
+                await self.save_transaction(target_charger, command)
+                # Update charger status based on command
+                cmd = command.lower()
+                if 'start' in cmd:
+                    status = 'charging'
+                elif 'stop' in cmd:
+                    status = 'available'
+                else:
+                    logger.error(f"Command {command} not supported for charger {target_charger}.")
+                await self.update_charger_status(target_charger, status)
+                await self.charge_point.route_message(content)
 
-    async def broadcast_status(self, event):
-
-        logger.info("Broadcasting status to all connected consumers.")
-        await self.send(text_data=json.dumps({
-            'event': 'status_update',
-            'charger_id': event['charger_serial_number'],
-            'data': event['status_data'],
-        }))
-
-    @database_sync_to_async
-    def save_status(self, serial_number, status, payload):
-        with transaction.atomic():
-            charger, _ = EVCharger.objects.get_or_create(serial_number=serial_number)
-            StatusLog.objects.create(charger=charger,
-                                     status=status,
-                                     payload=payload)
-            logger.info(
-                f"Status update received from charger {serial_number}: {status} - {payload}"
-            )
-
-    @database_sync_to_async
-    def save_heartbeat(self, serial_number, data):
-        charger, _ = EVCharger.objects.get_or_create(serial_number=serial_number)
-        HeartbeatLog.objects.create(charger=charger, payload=data)
-        logger.info(f"Heartbeat received from charger {serial_number}: {data}")
-
-    @database_sync_to_async
-    def save_transaction(self, serial_number, command):
-        if not hasattr(self, 'user') or self.user is None or not self.user.is_authenticated:
-            logger.error("Cannot save transaction: No authenticated user")
-            return
-
-        try:
-            customer = Customer.objects.get(user=self.user)
-        except Customer.DoesNotExist:
-            logger.error(f"No Customer found for user {self.user}")
-            return
-
-        try:
-            charger = EVCharger.objects.get(serial_number=serial_number)
-        except EVCharger.DoesNotExist:
-            logger.error(f"No charger found with serial number {serial_number}")
-            return
-
-        with transaction.atomic():
-            Transaction.objects.create(
-                charger=charger,
-                command=command,
-                customer=customer
-            )
-
-        logger.info(f"Transaction saved for charger {serial_number} with command {command}")
-
-    @database_sync_to_async
-    def update_charger_status(self, serial_number, command):
-        # Update charger status based on command
-        cmd = command.lower()
-        if 'start' in cmd:
-            status = 'busy'
-            activity = 'charging'
-            connected = True
-        elif 'stop' in cmd:
-            status = 'available'
-            activity = 'idle'
-            connected = False
-        else:
-            status = 'unknown'
-            activity = 'unknown'
-            connected = False
-
-        charger, _ = EVCharger.objects.get_or_create(serial_number=serial_number)
-        charger.status = status
-        charger.activity = activity
-        charger.connected = connected
-        charger.save()
-
-        StatusLog.objects.create(charger=charger, status=status)
-        logger.info(f"Updated charger {serial_number} status to {status} based on command {command}")
+                await self.channel_layer.group_send(
+                    self.group_name,
+                    {
+                        'type': 'broadcast_status',
+                        'charger_serial_number': self.charger_id,
+                        'status': status,
+                    }
+                )
+                logger.info(f"Command sent to charger {target_charger}: {command}")
+            except Exception as e:
+                logger.error(f"Error sending command to charger {target_charger}: {e}")
+                await self.send_json({'error': str(e)})

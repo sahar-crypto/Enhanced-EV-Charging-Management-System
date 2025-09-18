@@ -26,20 +26,21 @@ class EVChargerManager(models.Manager):
 class EVCharger(models.Model):
     STATUS_CHOICES = [
         ('available', 'Available'),
-        ('busy', 'Busy'),
-    ]
-    ACTIVITY_CHOICES = [
+        ('preparing', 'Preparing'),
         ('charging', 'Charging'),
-        ('idle', 'Idle'),
+        ('SuspendedEVSE', 'SuspendedEVSE'),
+        ('suspendedEV', 'SuspendedEV'),
+        ('reserved', 'Reserved'),
+        ('unavailable', 'Unavailable'),
+        ('faulted', 'Faulted'),
+        ('finishing', 'Finishing'),
     ]
     station = models.ForeignKey(Station, on_delete=models.CASCADE, related_name='station')
     serial_number = models.CharField(max_length=100, unique=True, null=False)
     model = models.CharField(max_length=100, null=True)
     vendor = models.CharField(max_length=100, null=True)
     capacity = models.IntegerField(null=True)
-    status = models.CharField(default='available', max_length=10, choices=STATUS_CHOICES)
-    connected = models.BooleanField(default=False)
-    activity = models.CharField(default='idle', max_length=10, choices=ACTIVITY_CHOICES)
+    status = models.CharField(default='available', max_length=20, choices=STATUS_CHOICES)
 
     objects = EVChargerManager()
 

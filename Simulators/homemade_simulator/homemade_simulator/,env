@@ -1,3 +1,0 @@
-# Connection variables
-WS_URL="ws://localhost:9000/ws/charging/station/DTS-CC-001/"
-CHARGER_ID="CHG001"

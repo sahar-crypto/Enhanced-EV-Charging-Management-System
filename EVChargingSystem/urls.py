@@ -22,5 +22,4 @@ urlpatterns = [
     path('', include('Users.urls')),
     path('charging/', include('Charging.urls')),
     path('invoices/', include('Invoicing.urls')),
-    path('commanding/', include('Commanding.urls')),
 ]
